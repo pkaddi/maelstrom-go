@@ -3,8 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -17,17 +17,52 @@ type Node struct {
 	Messages            []interface{}
 	Callbacks           map[float64]func(map[string]interface{})
 	CallbackMutex       sync.RWMutex
-	MsgResponseChannels map[string]chan map[string]interface{}
+	MsgResponseChannels map[float64]chan map[string]interface{}
+	StdinChan           chan map[string]interface{}
 }
 
 // Init initializes the node with a node ID and a list of peer IDs.
 func (n *Node) Init(id string) {
 	n.ID = id
 	n.Callbacks = make(map[float64]func(map[string]interface{}))
-	n.MsgResponseChannels = make(map[string]chan map[string]interface{})
+	n.MsgResponseChannels = make(map[float64]chan map[string]interface{})
+	n.StdinChan = make(chan map[string]interface{})
+	// read continuously from stdinChan
+	go func() {
+		for {
+			msg := <-n.StdinChan
+			n.HandleStdinMessage(msg)
+		}
+	}()
+
 }
 
-// main function to read json from stdin and create a node for every 'node_id' field. and respond to commands based on the 'type' field.
+// HandleStdinMessage handles a message from stdin.
+func (n *Node) HandleStdinMessage(jsonMap map[string]interface{}) {
+	if jsonMap["body"] != nil {
+		body := jsonMap["body"].(map[string]interface{})
+		if body["type"] != nil {
+			switch body["type"] {
+			case "echo":
+				n.Echo(jsonMap)
+			case "topology":
+				n.Topology(jsonMap)
+			case "broadcast_ok":
+				if body["in_reply_to"] != nil {
+					n.CallbackMutex.RLock()
+					msg_id := body["in_reply_to"].(float64)
+					n.MsgResponseChannels[msg_id] <- jsonMap
+					n.CallbackMutex.RUnlock()
+				}
+			case "broadcast":
+				n.Broadcast(jsonMap)
+			case "read":
+				n.Read(jsonMap)
+			}
+
+		}
+	}
+}
 
 // InitReply fucntion for Node
 func (n *Node) InitReply(req map[string]interface{}) {
@@ -58,113 +93,32 @@ func (n *Node) Broadcast(req map[string]interface{}) {
 	// add to list of messages
 	n.Messages = append(n.Messages, msg)
 
-	// create a list of unacknowledged peers
-	// n.UnackedPeers = make([]interface{}, len(n.PeerIDs))
-	// copy(n.UnackedPeers, n.PeerIDs)
-	// // delete the sender from the list
-	// for i, p := range n.UnackedPeers {
-	// 	if p == req["src"] {
-	// 		n.UnackedPeers = append(n.UnackedPeers[:i], n.UnackedPeers[i+1:]...)
-	// 	}
-	// }
-
-	// use BroadcastResponseChannel to wait for all replies and keep retrying until all peers have acknowledged. also send the message to all peers
-	//for len(n.UnackedPeers) > 0 {
-	// make n.MsgResponseChannels
-
 	retryDelay := 1 * time.Second
 	for _, p := range n.PeerIDs {
 
 		msgChannel := make(chan map[string]interface{})
-		// make msd_id as a combination of msg_id and peer_id
-		msg_id := strconv.FormatFloat(req["body"].(map[string]interface{})["msg_id"].(float64), 'E', -1, 32) + "_" + p.(string)
+		msg_id := rand.Float64()
 		n.CallbackMutex.Lock()
 		n.MsgResponseChannels[msg_id] = msgChannel
 		n.CallbackMutex.Unlock()
 
-		go func(p interface{}, msgChannel chan map[string]interface{}, msg_id string) {
-			// retry count for each peer
-			//retryCount := 0
-			n.Send(p, map[string]interface{}{"type": "broadcast", "message": msg, "msg_id": req["body"].(map[string]interface{})["msg_id"]})
+		go func(p interface{}, msgChannel chan map[string]interface{}, msg_id float64) {
+			n.Send(p, map[string]interface{}{"type": "broadcast", "message": msg, "msg_id": msg_id})
 			for {
 				select {
-				case jsonMap := <-msgChannel:
-					fmt.Fprintf(os.Stderr, "received broadcast_ok from peer")
-					fmt.Fprintf(os.Stderr, "jsonmap count: %v", jsonMap)
+				case <-msgChannel:
 					n.CallbackMutex.Lock()
 					delete(n.MsgResponseChannels, msg_id)
 					n.CallbackMutex.Unlock()
 					return
 				case <-time.After(retryDelay):
-					//if retryCount < 3 {
-					//fmt.Fprintf(os.Stderr, "sending broadcast to peers")
-					n.Send(p, map[string]interface{}{"type": "broadcast", "message": msg, "msg_id": req["body"].(map[string]interface{})["msg_id"]})
-					//retryCount++
-					//}
+					n.Send(p, map[string]interface{}{"type": "broadcast", "message": msg, "msg_id": msg_id})
 				}
 			}
 		}(p, msgChannel, msg_id)
 
 	}
-	// for len(n.UnackedPeers) > 0 {
-	// 	select {
-	// 	case resp := <-n.BroadcastResponseChannel:
-	// 		for i, p := range n.UnackedPeers {
-	// 			if p == resp["src"] {
-	// 				n.UnackedPeers = append(n.UnackedPeers[:i], n.UnackedPeers[i+1:]...)
-	// 			}
-	// 		}
-	// 	}
-	// }
-	//}
 }
-
-// n.BroadcastResponseChannel = make(chan map[string]interface{})
-// go func() {
-// 	for {
-// 		select {
-// 		case resp := <-n.BroadcastResponseChannel:
-// 			// remove the peer from the list of unacknowledged peers
-// 			for i, p := range n.UnackedPeers {
-// 				if p == resp["src"] {
-// 					n.UnackedPeers = append(n.UnackedPeers[:i], n.UnackedPeers[i+1:]...)
-// 				}
-// 			}
-// 			// if all peers have acknowledged, return
-// 			if len(n.UnackedPeers) == 0 {
-// 				return
-// 			}
-// 		}
-// 	}
-// }()
-
-// while len(peers) > 0
-
-// send broadcast message to all peers
-// fmt.Fprintln(os.Stderr, n.UnackedPeers)
-// //for len(n.UnackedPeers) > 0 {
-// //fmt.Fprintf(os.Stderr, "unacked peers: %v", n.UnackedPeers)
-// for i, p := range n.UnackedPeers {
-
-// 	n.Rpc(p, req, func(req map[string]interface{}) {
-// 		if req["body"].(map[string]interface{})["type"] == "broadcast_ok" {
-// 			unackedPeers := make([]interface{}, len(n.UnackedPeers))
-// 			// Copy the elements of 'n.UnackedPeers' into the new slice, skipping
-// 			// the element at index 'i'.
-// 			copy(unackedPeers, n.UnackedPeers[:i])
-// 			copy(unackedPeers[i:], n.UnackedPeers[i+1:])
-// 			// Replace 'n.UnackedPeers' with the new slice that doesn't include
-// 			// the element at index 'i'.
-// 			n.UnackedPeers = unackedPeers
-// 		}
-// 	})
-// 	// correct broadcast message send
-// 	//n.Send(p, map[string]interface{}{"type": "broadcast", "message": msg})
-// }
-//}
-
-//fmt.Fprintln(os.Stderr, n.Messages)
-//}
 
 // Topology sets peers of the node.
 func (n *Node) Topology(req map[string]interface{}) {
